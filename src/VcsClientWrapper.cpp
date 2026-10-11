@@ -29,6 +29,7 @@ namespace vcs {
 VcsClientWrapper::VcsClientWrapper()
     : mCallback(nullptr),
       mValidity(nullptr),
+      mGestureEngine(nullptr),
       mState(VCS_STATE_IDLE),
       mOperationId(0),
       mChallenge(0),
@@ -47,6 +48,22 @@ VcsClientWrapper::~VcsClientWrapper() {
 uint64_t VcsClientWrapper::generateRandom64() {
     uint64_t r = (((uint64_t)rand()) << 32) | ((uint64_t)rand());
     return (r != 0) ? r : 1;
+}
+
+void VcsClientWrapper::startNavigationModeLocked() {
+    if (mValidity != nullptr && mState == VCS_STATE_IDLE) {
+        vcs::vcsNavStart_t navStart = { 0 };
+        int ret = mValidity->StartNav(&navStart);
+        ALOGD("startNavigationModeLocked: StartNav returned %d", ret);
+    }
+}
+
+void VcsClientWrapper::stopNavigationModeLocked() {
+    if (mValidity != nullptr) {
+        vcs::vcsNavStop_t navStop = { 0 };
+        int ret = mValidity->StopNav(&navStop);
+        ALOGD("stopNavigationModeLocked: StopNav returned %d", ret);
+    }
 }
 
 bool VcsClientWrapper::init() {
@@ -93,16 +110,29 @@ bool VcsClientWrapper::init() {
         ALOGW("GetEnrolledFingerList failed during init (ret=%d), defaulting auth ID to 1", ret);
     }
 
+    // Inicializa o motor de gestos uinput
+    mGestureEngine = std::make_unique<GestureEngine>();
+    if (!mGestureEngine->init()) {
+        ALOGW("Warning: GestureEngine initialization failed; gestural navigation may be unavailable");
+    }
+
     mInitialized = true;
     mState = VCS_STATE_IDLE;
-    ALOGI("Validity native client interface successfully initialized");
+    startNavigationModeLocked();
+    ALOGI("Validity native client interface and GestureEngine successfully initialized");
     return true;
 }
 
 void VcsClientWrapper::release() {
     std::lock_guard<std::mutex> lock(mLock);
+    if (mGestureEngine != nullptr) {
+        ALOGI("Releasing GestureEngine...");
+        mGestureEngine->release();
+        mGestureEngine.reset();
+    }
     if (mValidity != nullptr) {
         ALOGI("Destroying Validity interface...");
+        stopNavigationModeLocked();
         unsigned int cancelRes = 0;
         mValidity->Cancel(cancelRes);
         vcs::DestroyInterface(mValidity);
@@ -188,6 +218,10 @@ int VcsClientWrapper::enroll(const uint8_t* hat_bytes, size_t hat_len, uint32_t 
 
     mCurrentEnrollFid = nextFid;
     mState = VCS_STATE_ENROLL;
+    stopNavigationModeLocked();
+    if (mGestureEngine != nullptr) {
+        mGestureEngine->setEnabled(false);
+    }
 
     ALOGI("Starting enroll operation for finger index %u (enrolled mask=0x%x)...", nextFid, mask);
     vcs::vcsEnrollUser_t enrollData(nextFid, "android", VCS_ENROLL_MODE_DEFAULT);
@@ -195,6 +229,10 @@ int VcsClientWrapper::enroll(const uint8_t* hat_bytes, size_t hat_len, uint32_t 
     if (ret != VCS_RESULT_OK) {
         ALOGE("mValidity->Enroll failed with error %d", ret);
         mState = VCS_STATE_IDLE;
+        if (mGestureEngine != nullptr) {
+            mGestureEngine->setEnabled(true);
+        }
+        startNavigationModeLocked();
         return -EIO;
     }
 
@@ -213,11 +251,19 @@ int VcsClientWrapper::authenticate(uint64_t operation_id, uint32_t gid) {
     mOperationId = operation_id;
     mActiveGid = gid;
     mState = VCS_STATE_SCAN;
+    stopNavigationModeLocked();
+    if (mGestureEngine != nullptr) {
+        mGestureEngine->setEnabled(false);
+    }
 
     int ret = mValidity->Identify("android");
     if (ret != VCS_RESULT_OK) {
         ALOGE("mValidity->Identify failed with error %d", ret);
         mState = VCS_STATE_IDLE;
+        if (mGestureEngine != nullptr) {
+            mGestureEngine->setEnabled(true);
+        }
+        startNavigationModeLocked();
         return -EIO;
     }
 
@@ -239,6 +285,10 @@ int VcsClientWrapper::cancel() {
 
     mState = VCS_STATE_IDLE;
     sendError(FINGERPRINT_ERROR_CANCELED, 0);
+    if (mGestureEngine != nullptr) {
+        mGestureEngine->setEnabled(true);
+    }
+    startNavigationModeLocked();
     return 0;
 }
 
@@ -367,28 +417,63 @@ int VcsClientWrapper::OnEvent(vcs::vcsCBEvent_t* pEvent) {
         return 0;
     }
 
+    // Timestamp atual para cálculo cinemático de gestos
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t nowMs = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+
     switch (pEvent->eventId) {
         case VCS_EVT_FINGER_DETECTED: // 11
             ALOGD("Event: Finger detected on sensor");
-            sendAcquired(FINGERPRINT_ACQUIRED_GOOD, 0);
+            if (mGestureEngine != nullptr && mState == VCS_STATE_IDLE) {
+                mGestureEngine->onFingerDetected(nowMs);
+            }
+            if (mState != VCS_STATE_IDLE) {
+                sendAcquired(FINGERPRINT_ACQUIRED_GOOD, 0);
+            }
             break;
 
         case VCS_EVT_FINGER_REMOVED: // 20
             ALOGD("Event: Finger removed from sensor");
+            if (mGestureEngine != nullptr && mState == VCS_STATE_IDLE) {
+                mGestureEngine->onFingerRemoved(nowMs);
+            }
             break;
 
         case VCS_EVT_SWIPE_SPEED_UPDATE: // 42
             ALOGD("Event: Swipe speed update: %u", pEvent->eventInfo);
-            if (pEvent->eventInfo == VCS_IMAGE_QUALITY_TOO_FAST) {
-                sendAcquired(FINGERPRINT_ACQUIRED_TOO_FAST, 0);
-            } else if (pEvent->eventInfo == VCS_IMAGE_QUALITY_TOO_SLOW) {
-                sendAcquired(FINGERPRINT_ACQUIRED_TOO_SLOW, 0);
+            if (mGestureEngine != nullptr && mState == VCS_STATE_IDLE) {
+                mGestureEngine->onSwipeSpeedUpdate(pEvent->eventInfo);
             }
+            if (mState != VCS_STATE_IDLE) {
+                if (pEvent->eventInfo == VCS_IMAGE_QUALITY_TOO_FAST) {
+                    sendAcquired(FINGERPRINT_ACQUIRED_TOO_FAST, 0);
+                } else if (pEvent->eventInfo == VCS_IMAGE_QUALITY_TOO_SLOW) {
+                    sendAcquired(FINGERPRINT_ACQUIRED_TOO_SLOW, 0);
+                }
+            }
+            break;
+
+        case VCS_EVT_SWIPE_DIRECTION: // 41
+            ALOGI("Event: Swipe direction event: %u", pEvent->eventInfo);
+            if (mGestureEngine != nullptr && mState == VCS_STATE_IDLE) {
+                if (pEvent->eventInfo == VCS_SWIPE_DIRECTION_DOWN) {
+                    mGestureEngine->injectClick(KEY_SYSTEM_NAVIGATION_DOWN);
+                } else if (pEvent->eventInfo == VCS_SWIPE_DIRECTION_UP) {
+                    mGestureEngine->injectClick(KEY_SYSTEM_NAVIGATION_UP);
+                }
+            }
+            break;
+
+        case VCS_EVT_GESTURE: // 427
+            ALOGI("Event: Native hardware gesture event: %u", pEvent->eventInfo);
             break;
 
         case VCS_EVT_EIV_FINGERPRINT_CAPTURED_BAD: // 45
             ALOGW("Event: Bad swipe quality captured");
-            sendAcquired(FINGERPRINT_ACQUIRED_PARTIAL, 0);
+            if (mState != VCS_STATE_IDLE) {
+                sendAcquired(FINGERPRINT_ACQUIRED_PARTIAL, 0);
+            }
             break;
 
         case VCS_EVT_ENROLL_CAPTURE_STATUS: { // 32
@@ -400,25 +485,31 @@ int VcsClientWrapper::OnEvent(vcs::vcsCBEvent_t* pEvent) {
                 ALOGI("Enroll status: progress=%d%%, totalSwipes=%d, badSwipes=%d, quality=0x%x",
                       status->progress, status->totalSwipes, status->badSwipes, status->imageQuality);
 
-                // Traduz qualidade para acquiredInfo
-                if (status->imageQuality & VCS_IMAGE_QUALITY_TOO_FAST) {
-                    sendAcquired(FINGERPRINT_ACQUIRED_TOO_FAST, 0);
-                } else if (status->imageQuality & VCS_IMAGE_QUALITY_TOO_SLOW) {
-                    sendAcquired(FINGERPRINT_ACQUIRED_TOO_SLOW, 0);
-                } else if (status->imageQuality & (VCS_IMAGE_QUALITY_TOO_SHORT | VCS_IMAGE_QUALITY_BAD_SWIPE)) {
-                    sendAcquired(FINGERPRINT_ACQUIRED_PARTIAL, 0);
-                } else if (status->imageQuality & VCS_IMAGE_QUALITY_SOMETHING_ON_THE_SENSOR) {
-                    sendAcquired(FINGERPRINT_ACQUIRED_INSUFFICIENT, 0);
-                } else {
-                    sendAcquired(FINGERPRINT_ACQUIRED_GOOD, 0);
+                if (mGestureEngine != nullptr && mState == VCS_STATE_IDLE) {
+                    mGestureEngine->onCaptureStatus(status->imageQuality, status->progress);
                 }
 
-                // Calcula amostras restantes (escala típica de 8 a 10 swipes)
-                int progress = std::clamp(status->progress, 0, 100);
-                int remaining = (progress >= 100) ? 0 : std::max(1, (100 - progress + 9) / 10);
+                if (mState == VCS_STATE_ENROLL) {
+                    // Traduz qualidade para acquiredInfo
+                    if (status->imageQuality & VCS_IMAGE_QUALITY_TOO_FAST) {
+                        sendAcquired(FINGERPRINT_ACQUIRED_TOO_FAST, 0);
+                    } else if (status->imageQuality & VCS_IMAGE_QUALITY_TOO_SLOW) {
+                        sendAcquired(FINGERPRINT_ACQUIRED_TOO_SLOW, 0);
+                    } else if (status->imageQuality & (VCS_IMAGE_QUALITY_TOO_SHORT | VCS_IMAGE_QUALITY_BAD_SWIPE)) {
+                        sendAcquired(FINGERPRINT_ACQUIRED_PARTIAL, 0);
+                    } else if (status->imageQuality & VCS_IMAGE_QUALITY_SOMETHING_ON_THE_SENSOR) {
+                        sendAcquired(FINGERPRINT_ACQUIRED_INSUFFICIENT, 0);
+                    } else {
+                        sendAcquired(FINGERPRINT_ACQUIRED_GOOD, 0);
+                    }
 
-                if (mCallback != nullptr && mState == VCS_STATE_ENROLL) {
-                    mCallback->onEnrollResult(mCurrentEnrollFid, mActiveGid, remaining);
+                    // Calcula amostras restantes (escala típica de 8 a 10 swipes)
+                    int progress = std::clamp(status->progress, 0, 100);
+                    int remaining = (progress >= 100) ? 0 : std::max(1, (100 - progress + 9) / 10);
+
+                    if (mCallback != nullptr) {
+                        mCallback->onEnrollResult(mCurrentEnrollFid, mActiveGid, remaining);
+                    }
                 }
             }
             break;
@@ -431,12 +522,20 @@ int VcsClientWrapper::OnEvent(vcs::vcsCBEvent_t* pEvent) {
             }
             mState = VCS_STATE_IDLE;
             mAuthenticatorId = getEnrolledFingerMask();
+            if (mGestureEngine != nullptr) {
+                mGestureEngine->setEnabled(true);
+            }
+            startNavigationModeLocked();
             break;
 
         case VCS_EVT_ENROLL_FAILED: // 424
             ALOGE("Event: Enroll failed");
             sendError(FINGERPRINT_ERROR_UNABLE_TO_PROCESS, 0);
             mState = VCS_STATE_IDLE;
+            if (mGestureEngine != nullptr) {
+                mGestureEngine->setEnabled(true);
+            }
+            startNavigationModeLocked();
             break;
 
         case VCS_EVT_IDENTIFY_SUCCESS: // 423
@@ -468,9 +567,9 @@ int VcsClientWrapper::OnEvent(vcs::vcsCBEvent_t* pEvent) {
                 hat.authenticator_id = mAuthenticatorId;
                 hat.authenticator_type = htobe32(HW_AUTH_FINGERPRINT);
 
-                struct timespec ts;
-                clock_gettime(CLOCK_MONOTONIC, &ts);
-                hat.timestamp = htobe64((uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+                struct timespec tokenTs;
+                clock_gettime(CLOCK_MONOTONIC, &tokenTs);
+                hat.timestamp = htobe64((uint64_t)tokenTs.tv_sec * 1000 + tokenTs.tv_nsec / 1000000);
 
                 if (mCallback != nullptr) {
                     mCallback->onAuthenticated(fid, mActiveGid,
@@ -483,6 +582,10 @@ int VcsClientWrapper::OnEvent(vcs::vcsCBEvent_t* pEvent) {
                 }
             }
             mState = VCS_STATE_IDLE;
+            if (mGestureEngine != nullptr) {
+                mGestureEngine->setEnabled(true);
+            }
+            startNavigationModeLocked();
             break;
         }
 
@@ -492,6 +595,10 @@ int VcsClientWrapper::OnEvent(vcs::vcsCBEvent_t* pEvent) {
                 mCallback->onAuthenticated(0, mActiveGid, nullptr, 0);
             }
             mState = VCS_STATE_IDLE;
+            if (mGestureEngine != nullptr) {
+                mGestureEngine->setEnabled(true);
+            }
+            startNavigationModeLocked();
             break;
 
         case VCS_EVT_SENSOR_FAILED_INITIALIZATION: // 4
@@ -499,6 +606,10 @@ int VcsClientWrapper::OnEvent(vcs::vcsCBEvent_t* pEvent) {
             ALOGE("Event: Sensor unrecoverable hardware error");
             sendError(FINGERPRINT_ERROR_HW_UNAVAILABLE, 0);
             mState = VCS_STATE_IDLE;
+            if (mGestureEngine != nullptr) {
+                mGestureEngine->setEnabled(true);
+            }
+            startNavigationModeLocked();
             break;
 
         case VCS_EVT_SENSOR_FINGERPRINT_CAPTURE_START: // 8

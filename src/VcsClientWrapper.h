@@ -10,9 +10,11 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <mutex>
+#include <memory>
 #include <hardware/fingerprint.h>
 #include "vcs/vcs_types.h"
 #include "vcs/CAPIHandler.h"
+#include "GestureEngine.h"
 
 namespace vcs {
 
@@ -65,15 +67,19 @@ public:
     int OnEvent(vcs::vcsCBEvent_t* pEvent) override;
 
     uint32_t getEnrolledFingerMask();
+    GestureEngine* getGestureEngine() const { return mGestureEngine.get(); }
 
 private:
     uint64_t generateRandom64();
     void sendAcquired(int32_t acquired_info, int32_t vendor_code = 0);
     void sendError(int32_t error, int32_t vendor_code = 0);
+    void startNavigationModeLocked();
+    void stopNavigationModeLocked();
 
     std::mutex mLock;
     IVcsClientCallback* mCallback;
     vcs::IValidity* mValidity;
+    std::unique_ptr<GestureEngine> mGestureEngine;
     VcsWorkerState mState;
 
     uint64_t mOperationId;
