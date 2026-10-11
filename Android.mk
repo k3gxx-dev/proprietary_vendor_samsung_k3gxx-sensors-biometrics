@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-LOCAL_PATH := $(call my-dir)
+SENSORS_BIOMETRICS_ROOT := $(call my-dir)
+LOCAL_PATH := $(SENSORS_BIOMETRICS_ROOT)
 
 define k3gxx-sensor-prebuilt
 include $(CLEAR_VARS)
@@ -60,5 +61,5 @@ $(eval $(call k3gxx-sensor-prebuilt,libvfmtztransport,proprietary/lib/libvfmtztr
 $(eval $(call k3gxx-sensor-exec,vcsFPService,proprietary/bin/vcsFPService))
 
 # Fingerprint open-source HAL and HIDL service
-include $(LOCAL_PATH)/hal/Android.mk
-include $(LOCAL_PATH)/service/Android.mk
+include $(SENSORS_BIOMETRICS_ROOT)/hal/Android.mk
+include $(SENSORS_BIOMETRICS_ROOT)/service/Android.mk
