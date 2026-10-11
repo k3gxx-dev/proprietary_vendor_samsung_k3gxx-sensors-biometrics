@@ -95,12 +95,10 @@ struct vcsInterface_t {
 };
 
 /**
- * Funções exportadas por libvfmClient.so
+ * Funções exportadas por libvfmClient.so (mangled C++ symbols em vcs::)
  */
-extern "C" {
-    int CreateInterface(const vcsInterface_t* pInterfaceInfo, IValidity*& pValidity);
-    int DestroyInterface(IValidity* pValidity);
-}
+int CreateInterface(const vcsInterface_t* pInterfaceInfo, IValidity*& pValidity);
+int DestroyInterface(IValidity* pValidity);
 
 } // namespace vcs
 
