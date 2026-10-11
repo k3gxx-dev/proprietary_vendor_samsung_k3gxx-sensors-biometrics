@@ -74,20 +74,23 @@ public:
         notifyCaller(&msg);
     }
 
-    void onRemoved(uint32_t fid, uint32_t /*gid*/) override {
-        ALOGI("HalCallbackForwarder::onRemoved: fid=%u", fid);
+    void onRemoved(uint32_t fid, uint32_t gid) override {
+        ALOGI("HalCallbackForwarder::onRemoved: fid=%u, gid=%u", fid, gid);
         fingerprint_msg_t msg = {};
         msg.type = FINGERPRINT_TEMPLATE_REMOVED;
         msg.data.removed.finger.fid = fid;
+        msg.data.removed.finger.gid = gid;
+        msg.data.removed.remaining_templates = 0;
         notifyCaller(&msg);
     }
 
-    void onEnumerate(uint32_t fid, uint32_t /*gid*/, uint32_t /*remaining*/) override {
-        ALOGD("HalCallbackForwarder::onEnumerate: fid=%u", fid);
-        // HAL 2.0 enumerate retorna lista síncrona ou enumeração
+    void onEnumerate(uint32_t fid, uint32_t gid, uint32_t remaining) override {
+        ALOGD("HalCallbackForwarder::onEnumerate: fid=%u, gid=%u, remaining=%u", fid, gid, remaining);
         fingerprint_msg_t msg = {};
         msg.type = FINGERPRINT_TEMPLATE_ENUMERATING;
         msg.data.enumerated.finger.fid = fid;
+        msg.data.enumerated.finger.gid = gid;
+        msg.data.enumerated.remaining_templates = remaining;
         notifyCaller(&msg);
     }
 
@@ -147,25 +150,10 @@ int fingerprint_cancel(struct fingerprint_device* device) {
     return vdev->wrapper->cancel();
 }
 
-int fingerprint_enumerate(struct fingerprint_device* device, fingerprint_finger_id_t* results, uint32_t* max_size) {
+int fingerprint_enumerate(struct fingerprint_device* device) {
+    if (device == nullptr) return -EINVAL;
     vcs_fingerprint_device_impl_t* vdev = reinterpret_cast<vcs_fingerprint_device_impl_t*>(device);
-    uint32_t mask = vdev->wrapper->getEnrolledFingerMask();
-    uint32_t count = 0;
-
-    for (uint32_t idx = 1; idx <= 5; ++idx) {
-        if ((mask >> idx) & 1) {
-            if (results != nullptr && max_size != nullptr && count < *max_size) {
-                results[count].fid = idx;
-                results[count].gid = 0;
-            }
-            count++;
-        }
-    }
-
-    if (max_size != nullptr) {
-        *max_size = count;
-    }
-    return count;
+    return vdev->wrapper->enumerate();
 }
 
 int fingerprint_remove(struct fingerprint_device* device, uint32_t gid, uint32_t fid) {
