@@ -1,0 +1,15 @@
+# Consolidated Fingerprint Init and Device Node Definitions for Samsung Galaxy S5 (k3gxx)
+# Extracted from device/samsung/k3gxx/ramdisk/
+
+# Device node permissions (from ueventd.universal5422.rc)
+/dev/vfsspi               0660   system     system
+
+# Sysfs permissions (from init.universal5422.rc)
+on boot
+    chown system radio /sys/class/fingerprint/fingerprint/type_check
+
+# Daemon definition (from init.universal5422.rc)
+service vcsFPService /vendor/bin/vcsFPService
+    class late_start
+    user system
+    group system input
