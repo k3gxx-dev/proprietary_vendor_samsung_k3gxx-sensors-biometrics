@@ -28,7 +28,8 @@ LOCAL_MODULE_TAGS := optional
 
 LOCAL_SRC_FILES := \
     fingerprint.cpp \
-    ../src/VcsClientWrapper.cpp
+    ../src/VcsClientWrapper.cpp \
+    ../src/GestureEngine.cpp
 
 LOCAL_C_INCLUDES := \
     $(LOCAL_PATH)/../include \

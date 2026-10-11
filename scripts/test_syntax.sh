@@ -36,6 +36,12 @@ elif g++ -std=c++17 -I. tmp_test_syntax.cpp -o tmp_test_syntax; then
     echo "Running host compilation verification (64-bit host):"
     ./tmp_test_syntax
 fi
-
 rm -f tmp_test_syntax tmp_test_syntax.cpp
 echo "=== Basic struct verification passed ==="
+
+echo "=== Compiling and running GestureEngine unit tests ==="
+g++ -std=c++17 -Wall -Wextra -I. -Iinclude tests/test_gesture_engine.cpp src/GestureEngine.cpp -o tmp_test_gesture
+./tmp_test_gesture
+rm -f tmp_test_gesture
+
+echo "=== All syntax and unit tests passed successfully ==="
