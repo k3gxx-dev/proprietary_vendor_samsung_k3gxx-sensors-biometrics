@@ -1,105 +1,114 @@
-# Arquitetura da Pilha Biométrica do Samsung Galaxy S5 (k3gxx)
+# Arquitetura da Stack Biométrica Validity VFS61xx (k3gxx)
 
-Este documento descreve detalhadamente a arquitetura de hardware, kernel, middleware proprietário e integração com o Android para o leitor de impressão digital do **Samsung Galaxy S5 3G (`SM-G900H` / `k3gxx`, Exynos 5422)**.
+## 1. Visão Geral
+Este documento descreve a arquitetura da stack biométrica do sensor de deslizamento (swipe) **Validity / Synaptics VFS61xx** integrado no **Samsung Galaxy S5 3G (SM-G900H / `k3gxx`)** no contexto do **LineageOS 18.1 (Android 11)**.
+
+Historicamente, a implementação de impressão digital neste aparelho dependia de:
+1. `vcsFPService` (daemon nativo executando em background, comunicando-se com o TrustZone/MobiCore via `libvfmtztransport.so`).
+2. `ValidityService.apk` (aplicativo de sistema Java legado que instanciava o serviço em segundo plano).
+3. `libvcsfp.so` (biblioteca JNI que ligava o Java à `libvfmClient.so`).
+4. Sockets IPC locais (`validityservice` e `validityservice_callback`).
+5. HAL legada em C (`hal/fingerprint.c`, API 2.0) que fazia parsing de strings ASCII via sockets.
+
+O objetivo da modernização é eliminar completamente o `ValidityService.apk`, a camada JNI e os sockets locais legados, substituindo-os por uma **HAL HIDL 2.1 C++ nativa moderna (`IBiometricsFingerprint`)** que consome diretamente as interfaces de `libvfmClient.so`.
 
 ---
 
-## 1. Visão Geral das Camadas
+## 2. Topologia do Pipeline de Execução
 
-A pilha biométrica do Galaxy S5 é única porque combina um **sensor capacitivo de deslizamento (*swipe sensor*)** lançado na era do Android 4.4 (KitKat) com as APIs modernas de biometria introduzidas a partir do Android 6.0 e presentes no Android 11.
-
-```mermaid
-flowchart TD
-    subgraph AndroidFramework ["Android 11 Framework"]
-        BP["BiometricPrompt / FingerprintManager"]
-    end
-
-    subgraph OpenSourceHAL ["Camada Open-Source (LineageOS)"]
-        HAL["hal/fingerprint.c (fingerprint.universal5422.so)"]
-        VS_APK["ValidityService.apk (Java Background Service)"]
-    end
-
-    subgraph ProprietaryVendor ["Middleware Proprietário (32-bit ELF)"]
-        DAEMON["vcsFPService (Daemon em /vendor/bin)"]
-        LIB_CORE["libvcsfp.so (Motor de Captura e Estado)"]
-        LIB_AUTH["libvalAuth.so (Cálculo de Minúcias)"]
-        LIB_TZ["libvfmtztransport.so (Transporte TEE)"]
-    end
-
-    subgraph SecureWorld ["ARM TrustZone (MobiCore T-Base)"]
-        MC_DAEMON["mcDriverDaemon"]
-        TRUSTLET["Trustlet de Biometria (*.tlbin)"]
-    end
-
-    subgraph KernelHW ["Kernel Linux & Hardware"]
-        KDRIVER["kernel/drivers/fingerprint/vfs61xx.c (/dev/vfsspi)"]
-        HW["Hardware Físico: Sensor Validity VFS61xx (Botão Home)"]
-    end
-
-    BP <==> |Binder / HIDL 2.1| HAL
-    HAL <==> |UNIX Sockets: validityservice & validityservice_callback| VS_APK
-    VS_APK <==> |JNI / IPC Local| DAEMON
-    DAEMON --> LIB_CORE
-    LIB_CORE --> LIB_AUTH
-    LIB_CORE --> LIB_TZ
-    LIB_TZ <==> |libMcClient.so (/dev/mobicore)| MC_DAEMON
-    MC_DAEMON <==> |SMC - Secure Monitor Call| TRUSTLET
-    DAEMON <==> |ioctl() em /dev/vfsspi| KDRIVER
-    KDRIVER <==> |Barramento SPI & GPIO IRQ| HW
+```
++-------------------------------------------------------------------+
+|               Android Framework (BiometricService)                |
++-------------------------------------------------------------------+
+                                  |
+                                  | HIDL 2.1 (hwbinder)
+                                  v
++-------------------------------------------------------------------+
+|  android.hardware.biometrics.fingerprint@2.1-service.universal5422|
+|  - BiometricsFingerprint (service/BiometricsFingerprint.cpp)      |
+|  - VcsClientWrapper (src/VcsClientWrapper.cpp)                    |
+|  - Implementa vcs::IListener                                      |
++-------------------------------------------------------------------+
+                                  |
+                                  | Chamadas C++ nativas
+                                  v
++-------------------------------------------------------------------+
+|  libvfmClient.so                                                  |
+|  - vcs::CreateInterface / vcs::DestroyInterface                   |
+|  - vcs::CAPIHandlerClient / vcs::IValidity                        |
+|  - vcs::CPipe (comunicação via named pipes em /dev/validity/)     |
++-------------------------------------------------------------------+
+                                  |
+                                  | Named Pipes (/dev/validity/*)
+                                  v
++-------------------------------------------------------------------+
+|  vcsFPService (Daemon do Sensor)                                  |
+|  - Controle de hardware e processamento preliminar                |
+|  - Carrega libvfmtztransport.so e libvalAuth.so                   |
++-------------------------------------------------------------------+
+                                  |
+                                  | DCI Buffer / MobiCore Driver
+                                  v
++-------------------------------------------------------------------+
+|  MobiCore TrustZone Secure OS                                     |
+|  - Trustlet de biometria Validity                                 |
+|  - Matching criptográfico seguro e armazenamento de templates     |
++-------------------------------------------------------------------+
 ```
 
 ---
 
-## 2. O Sensor Físico (Validity VFS61xx)
+## 3. Máquina de Estados e Ciclo de Vida do Sensor Swipe
 
-* **Tipo:** Sensor capacitivo de varredura (*swipe array*).
-* **Localização:** Integrado diretamente sob o vidro do botão Home físico.
-* **Barramento:** SPI mestre com linha de interrupção dedicada (GPIO IRQ) e clock configurável.
-* **Mecanismo de Leitura:** 
-  Ao contrário de sensores modernos de toque (*touch area sensors*) que capturam uma imagem bidimensional de 200x200 pixels instantaneamente, o VFS61xx possui apenas uma matriz linear muito estreita (uma faixa de poucos pixels de altura).
-  À medida que o usuário desliza o dedo de cima para baixo sobre o botão, o sensor transmite "fatias" (*slices*) sucessivas de dados brutos via SPI em alta velocidade. O software deve juntar (*stitch*) essas fatias em um quadro coerente.
+Diferente de sensores modernos de toque capacitivo ("touch"), o Validity VFS61xx é um sensor de deslizamento ("swipe"). O ciclo de captura requer movimento contínuo do dedo sobre a área do sensor sob velocidade e pressão controladas.
 
----
+### 3.1 Estados de Operação da HAL
+- **`STATE_IDLE`**: Sensor em repouso / baixo consumo. Aguarda solicitação do framework.
+- **`STATE_ENROLL`**: Sessão de cadastro ativa. O usuário deve deslizar o dedo repetidas vezes (normalmente 8 a 10 swipes válidos) até acumular cobertura angular e minúcias suficientes.
+- **`STATE_SCAN` (Authenticate / Identify)**: Sessão de autenticação ativa. O sensor aguarda a detecção do dedo e o deslizamento completo para extração e envio ao TrustZone.
+- **`STATE_CANCELING`**: Transição de parada solicitada via `cancel()`. O wrapper sinaliza cancelamento à `libvfmClient.so` e retorna a `STATE_IDLE`.
 
-## 3. Fluxo de Execução de uma Leitura Biométrica
+### 3.2 Diagrama de Transição de Estados de Captura
 
-### Passo a Passo:
-1. **Ativação:**  
-   O usuário acende a tela ou um app bancário exibe o `BiometricPrompt`.  
-   O framework chama `authenticate()` na HAL [`hal/fingerprint.c`](file:///zRAID/builds/k3gxx-lineage-18.1/vendor/samsung/k3gxx/sensors-biometrics/hal/fingerprint.c).
-2. **Disparo do Comando:**  
-   A HAL envia o opcode `CALL_IDENTIFY` através do socket `/dev/socket/validityservice` para o `ValidityService.apk`.
-3. **Preparação do Sensor:**  
-   O `vcsFPService` abre `/dev/vfsspi`, emite um `ioctl` de ativação de clock (`VFS_IOCTL_SET_CLK`), reseta o hardware e aguarda a interrupção de contato elétrico no pino GPIO (quando a pele do dedo toca no metal do botão Home).
-4. **Captura do Deslizamento:**  
-   Quando o dedo começa a passar, o chip dispara interrupções sucessivas. O `vcsFPService` lê os buffers de imagem crua via SPI (`VFS_IOCTL_READ`).
-5. **Comunicação com o TrustZone:**  
-   O `libvfmtztransport.so` aloca um buffer compartilhado (DCI Buffer) via ION/secmem e chama `mcNotify()` no MobiCore.
-6. **Autenticação Segura:**  
-   O trustlet seguro dentro do ARM TrustZone extrai os pontos característicos (minúcias) da imagem, compara com os templates criptografados salvos no dispositivo e responde com um código de sucesso ou falha.
-7. **Callback para o Android:**  
-   O resultado é despachado de volta pelo socket assíncrono `validityservice_callback`, recebido pela thread ouvinte de `fingerprint.c` e notificado ao sistema operacional através de `notify(FINGERPRINT_AUTHENTICATED)`.
+```mermaid
+stateDiagram-v2
+    [*] --> STATE_IDLE
+    STATE_IDLE --> STATE_SCAN: authenticate(op_id)
+    STATE_IDLE --> STATE_ENROLL: enroll(hat, gid, timeout)
+    
+    state STATE_SCAN {
+        [*] --> SCAN_WAIT_FINGER
+        SCAN_WAIT_FINGER --> SCAN_SWIPE_IN_PROGRESS: VCS_EVT_FINGER_DETECTED
+        SCAN_SWIPE_IN_PROGRESS --> SCAN_EVALUATING: VCS_EVT_SENSOR_FINGERPRINT_CAPTURE_COMPLETE
+        SCAN_EVALUATING --> SCAN_SUCCESS: VCS_EVT_IDENTIFY_SUCCESS
+        SCAN_EVALUATING --> SCAN_FAIL: VCS_EVT_IDENTIFY_FAILED
+        SCAN_EVALUATING --> SCAN_RETRY: VCS_EVT_EIV_FINGERPRINT_CAPTURED_BAD / FEEDBACK
+        SCAN_RETRY --> SCAN_WAIT_FINGER: Nova tentativa de deslizamento
+    }
+    
+    state STATE_ENROLL {
+        [*] --> ENROLL_WAIT_SWIPE
+        ENROLL_WAIT_SWIPE --> ENROLL_PROCESSING: VCS_EVT_FINGER_DETECTED -> CAPTURE_COMPLETE
+        ENROLL_PROCESSING --> ENROLL_PROGRESS: VCS_EVT_ENROLL_CAPTURE_STATUS (samples_remaining--)
+        ENROLL_PROGRESS --> ENROLL_WAIT_SWIPE: Mais swipes necessários
+        ENROLL_PROCESSING --> ENROLL_DONE: VCS_EVT_ENROLL_SUCCESS (remaining = 0)
+    }
 
----
-
-## 4. O Protocolo de Sockets entre HAL e Middleware
-
-Definido em [`hal/fp_k3gxx.h`](file:///zRAID/builds/k3gxx-lineage-18.1/vendor/samsung/k3gxx/sensors-biometrics/hal/fp_k3gxx.h):
-
-| Comando (Byte Hex) | Nome Simbólico | Descrição |
-| :--- | :--- | :--- |
-| `0x01` | `CALL_INITSERVICE` | Inicializa a conexão com o daemon de biometria |
-| `0x02` | `CALL_ENROLL` | Inicia a sessão de cadastro de uma nova digital |
-| `0x03` | `CALL_IDENTIFY` | Coloca o sensor em modo de escuta para autenticação |
-| `0x04` | `CALL_REMOVE` | Apaga a digital do banco de dados seguro |
-| `0x05` | `CALL_CANCEL` | Aborta a operação atual (ex: tela desligou) |
-| `0x06` | `CALL_GET_ENROLLED_FINGER_LIST` | Retorna máscara de bits com os dedos cadastrados |
-| `0x07` | `CALL_CLEANUP` | Encerra a sessão e desliga a alimentação do sensor |
+    STATE_SCAN --> STATE_IDLE: Match / Fail / Cancel
+    STATE_ENROLL --> STATE_IDLE: Enroll Concluído / Cancel
+```
 
 ---
 
-## 5. Gargalos Identificados na Implementação Atual
+## 4. Mapeamento de Eventos e Qualidade de Imagem
 
-* **Duplo Intermediário IPC:** Ter `fingerprint.c` conversando com Java (`ValidityService`) e este conversando com C++ (`vcsFPService`) adiciona até 300ms de latência desnecessária no desbloqueio.
-* **Problemas de Sincronismo do Swipe:** Se o usuário deslizar o dedo com muita pressa antes do socket responder `CALL_IDENTIFY`, a leitura é ignorada silenciosamente.
-* **Dependência do TEE:** Como a chave de autenticação é manipulada pelo TrustZone, qualquer nova HAL deve replicar exatamente a interface do cliente MobiCore (`mc_linux.h`), sem tentar implementar o matching biométrico fora do ambiente seguro.
+Durante um deslizamento, o sensor emite eventos granulares que devem ser convertidos em `acquiredInfo` ou `error` do HIDL:
+- **`VCS_EVT_FINGER_DETECTED`**: Dedo detectado no sensor. Emite `FINGERPRINT_ACQUIRED_TOUCH_DETECTED` ou inicia buffer.
+- **`VCS_EVT_SWIPE_SPEED_UPDATE` / `VCS_IMAGE_QUALITY_TOO_FAST`**: Deslizamento excessivamente rápido. Traduz para `FINGERPRINT_ACQUIRED_TOO_FAST`.
+- **`VCS_IMAGE_QUALITY_TOO_SLOW`**: Deslizamento lento demais. Traduz para `FINGERPRINT_ACQUIRED_TOO_SLOW`.
+- **`VCS_IMAGE_QUALITY_BAD_SWIPE` / `VCS_IMAGE_QUALITY_PARTIAL_TOUCH`**: Captura parcial ou incompleta. Traduz para `FINGERPRINT_ACQUIRED_PARTIAL`.
+- **`VCS_IMAGE_QUALITY_SOMETHING_ON_THE_SENSOR`**: Sensor sujo. Traduz para `FINGERPRINT_ACQUIRED_INSUFFICIENT`.
+- **`VCS_EVT_IDENTIFY_SUCCESS`**: Identificação concluída com sucesso. Traduz para `onAuthenticated(fid, token)`.
+- **`VCS_EVT_IDENTIFY_FAILED`**: Nenhuma correspondência encontrada. Traduz para `onAuthenticated(0, empty_token)`.
+- **`VCS_EVT_ENROLL_CAPTURE_STATUS`**: Atualização do progresso da matrícula com status de cobertura.
+- **`VCS_EVT_ENROLL_SUCCESS`**: Matrícula finalizada com template persistido no TrustZone.

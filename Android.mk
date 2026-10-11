@@ -59,5 +59,6 @@ $(eval $(call k3gxx-sensor-prebuilt,libvfmClient,proprietary/lib/libvfmClient.so
 $(eval $(call k3gxx-sensor-prebuilt,libvfmtztransport,proprietary/lib/libvfmtztransport.so,))
 $(eval $(call k3gxx-sensor-exec,vcsFPService,proprietary/bin/vcsFPService))
 
-# Fingerprint open-source HAL
+# Fingerprint open-source HAL and HIDL service
 include $(LOCAL_PATH)/hal/Android.mk
+include $(LOCAL_PATH)/service/Android.mk
